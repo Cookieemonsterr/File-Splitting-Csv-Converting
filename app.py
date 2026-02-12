@@ -438,7 +438,6 @@ if uploaded_files:
                 lines = [f"{sh}: rows_read={b} | rows_after_clean={a}" for sh, (b, a) in result["row_report"].items()]
                 z.writestr(f"{folder}/INFO_rows_report.txt", "\n".join(lines))
 
-            # ---------------- Convert only (keep original filename) ----------------
            # ---------------- Convert only = ONLY convert (NO outlet splitting) ----------------
 if mode == "Convert only (no splitting)":
     if result["type"] == "excel":
@@ -473,7 +472,6 @@ if mode == "Convert only (no splitting)":
 
     z.writestr(f"{folder}/INFO.txt", "Convert-only mode → converted ONLY (no outlet splitting).")
     continue
-
 
             # ---------------- Auto split + convert (NO combined output) ----------------
             if result["type"] == "excel":
