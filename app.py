@@ -439,35 +439,41 @@ if uploaded_files:
                 z.writestr(f"{folder}/INFO_rows_report.txt", "\n".join(lines))
 
             # ---------------- Convert only (keep original filename) ----------------
-            if mode == "Convert only (no splitting)":
-                if result["type"] == "excel":
-                    sheets = result["sheets"] or {}
-                    if not sheets:
-                        z.writestr(f"{folder}/ERROR.txt", "No readable data found in this Excel file.")
-                        continue
+           # ---------------- Convert only = ONLY convert (NO outlet splitting) ----------------
+if mode == "Convert only (no splitting)":
+    if result["type"] == "excel":
+        sheets = result["sheets"] or {}
+        if not sheets:
+            z.writestr(f"{folder}/ERROR.txt", "No readable data found in this Excel file.")
+            continue
 
-                    if output_format.startswith("XLSX"):
-                        # ✅ single output file same name, multi-sheet workbook
-                        write_workbook_convert_only(z, f"{folder}/{base}", sheets)
-                    else:
-                        # CSV: if one sheet => base.csv, if many sheets => base__SheetName.csv (no combined)
-                        if len(sheets) == 1:
-                            only_sh = next(iter(sheets.keys()))
-                            write_file(z, f"{folder}/{base}", sheets[only_sh], sheet_name=only_sh)
-                        else:
-                            for sh, df_sh in sheets.items():
-                                write_file(z, f"{folder}/{base}__{safe_name(sh)}", df_sh, sheet_name=sh)
+        if output_format.startswith("XLSX"):
+            # ✅ Keep ALL sheets, ONE workbook, same name
+            z.writestr(f"{folder}/{base}.xlsx", to_xlsx_bytes_multi_sheet(sheets))
 
-                else:
-                    df = result["df"]
-                    if df is None or df.empty:
-                        z.writestr(f"{folder}/ERROR.txt", "No readable rows found.")
-                        continue
-                    # ✅ single output file same name
-                    write_file(z, f"{folder}/{base}", df, sheet_name=base)
+        else:
+            # ✅ CSV cannot store multiple sheets, so make ONE CSV by stacking
+            frames = []
+            for sh, df_sh in sheets.items():
+                out = df_sh.copy()
+                out.insert(0, "_sheet", sh)  # keeps sheet origin
+                frames.append(out)
+            merged = pd.concat(frames, ignore_index=True)
 
-                z.writestr(f"{folder}/INFO.txt", "Convert-only mode → no splitting performed.")
-                continue
+            write_file(z, f"{folder}/{base}", merged, sheet_name=base)
+
+    else:
+        # table/text/fake-xls -> ONE file, same name
+        df = result["df"]
+        if df is None or df.empty:
+            z.writestr(f"{folder}/ERROR.txt", "No readable rows found.")
+            continue
+
+        write_file(z, f"{folder}/{base}", df, sheet_name=base)
+
+    z.writestr(f"{folder}/INFO.txt", "Convert-only mode → converted ONLY (no outlet splitting).")
+    continue
+
 
             # ---------------- Auto split + convert (NO combined output) ----------------
             if result["type"] == "excel":
