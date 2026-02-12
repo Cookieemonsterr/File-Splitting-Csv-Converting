@@ -348,8 +348,6 @@ uploaded_files = st.file_uploader("Upload file(s)", type=SUPPORTED_TYPES, accept
 mode = st.radio("What do you want to do?", ["Auto split + convert", "Convert only"], index=0)
 output_format = st.radio("Output format", ["CSV", "XLSX"], index=0)
 
-exclude_zero = st.checkbox("Exclude stock/outlet_value = 0 (splitting only)", value=False)
-
 keep_outlet_id_only_in_filename = st.checkbox(
     "When splitting, keep outlet id only in the filename",
     value=True
