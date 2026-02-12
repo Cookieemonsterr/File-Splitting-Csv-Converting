@@ -464,9 +464,8 @@ if uploaded_files:
                             out.insert(0, "outlet_id", sh)
                         out.insert(0 if keep_outlet_id_only_in_filename else 1, "_sheet", sh)
                         combined_frames.append(out)
-                        write_file(z, f"{folder}/outlet_{safe_name(sh)}", out, sheet_name=sh)
+                        write_file(z, f"{folder}/{safe_name(sh)}", out, sheet_name=sh)
                     combined_df = pd.concat(combined_frames, ignore_index=True)
-                    write_file(z, f"{folder}/combined", combined_df, sheet_name="combined")
                     write_file(z, f"{folder}/long_format", combined_df, sheet_name="long_format")
                     z.writestr(f"{folder}/INFO.txt", "Detected multiple sheets → treated each sheet as an outlet.")
                     continue
@@ -483,7 +482,6 @@ if uploaded_files:
             outlet_cols = detect_outlet_columns(df)
             if outlet_cols:
                 base_cols = [c for c in df.columns if c not in outlet_cols]
-                write_file(z, f"{folder}/combined", df, sheet_name="combined")
 
                 long_df = df.melt(
                     id_vars=base_cols,
@@ -504,7 +502,7 @@ if uploaded_files:
                         out_df = out_df[~v.isin(["", "0", "0.0"])]
                     if not keep_outlet_id_only_in_filename:
                         out_df.insert(0, "outlet_id", oc)
-                    write_file(z, f"{folder}/outlet_{safe_name(oc)}", out_df, sheet_name=str(oc))
+                    write_file(z, f"{folder}/{safe_name(oc)}", out_df, sheet_name=str(oc))
 
                 z.writestr(f"{folder}/INFO.txt", "Detected outlets as COLUMNS (numeric outlet ids in headers).")
                 continue
@@ -519,14 +517,13 @@ if uploaded_files:
                 outlet_row_col = detect_outlet_row_column_smart(df)
 
             if outlet_row_col:
-                write_file(z, f"{folder}/combined", df, sheet_name="combined")
                 z.writestr(f"{folder}/INFO_outlet_column.txt", f"Outlet column detected: {outlet_row_col}")
 
                 for outlet, grp in df.groupby(outlet_row_col, dropna=False):
                     grp = grp.copy()
                     if not keep_outlet_id_only_in_filename:
                         grp.insert(0, "outlet_id", outlet)
-                    write_file(z, f"{folder}/outlet_{safe_name(outlet)}", grp, sheet_name=str(outlet))
+                    write_file(z, f"{folder}/{safe_name(outlet)}", grp, sheet_name=str(outlet))
 
                 long_df = df.copy()
                 long_df.insert(0, "outlet_id", long_df[outlet_row_col])
@@ -536,7 +533,9 @@ if uploaded_files:
                 continue
 
             # fallback
-            write_file(z, f"{folder}/combined", df, sheet_name="combined")
+            base = safe_name(uploaded.name.rsplit(".", 1)[0])
+            write_file(z, f"{folder}/{base}", df, sheet_name=base)
+
             z.writestr(f"{folder}/INFO.txt", "No outlet detected → exported combined only.")
 
     st.success("Processed files successfully ✅")
