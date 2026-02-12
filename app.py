@@ -96,9 +96,6 @@ def to_xlsx_bytes_single_sheet(df: pd.DataFrame, sheet_name: str = "Sheet1") -> 
     return bio.getvalue()
 
 def to_xlsx_bytes_multi_sheet(sheets: dict) -> bytes:
-    """
-    sheets: {sheet_name: dataframe}
-    """
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         for sh, df in sheets.items():
@@ -237,10 +234,8 @@ def read_excel_sheet_smart_from_bytes(excel_bytes: io.BytesIO, sheet_name: str, 
         dtype=object, engine=engine, keep_default_na=False, na_filter=False
     )
 
-    before_rows = len(df)
     df = clean_df(df)
-    after_rows = len(df)
-    return df, header_row, before_rows, after_rows
+    return df, header_row
 
 # ---------------- Fake XLS fallback (keeps rows) ----------------
 
@@ -250,11 +245,6 @@ def looks_like_utf16_text(sample: bytes) -> bool:
     return b"\x00" in sample
 
 def try_read_delimited_bytes_as_df(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
-    """
-    Robust fake-xls reader:
-    1) Try UTF-16 TSV
-    2) If row count seems too low, strip null bytes and parse TSV
-    """
     def parse_bytes(enc, sep, b):
         bio = io.BytesIO(b)
         df = pd.read_csv(
@@ -279,7 +269,6 @@ def try_read_delimited_bytes_as_df(file_bytes: bytes) -> tuple[pd.DataFrame, str
         try:
             df = parse_bytes(enc, sep, file_bytes)
             if df is not None and not df.empty and len(df.columns) > 1:
-                # if suspiciously low vs raw newline estimate -> try null-strip
                 if approx_lines and len(df) < int(approx_lines * 0.8):
                     break
                 return df, f"Parsed as delimited text (enc={enc}, sep=TAB)"
@@ -320,24 +309,19 @@ def read_text_table_with_fallback(file_like, sep: str) -> tuple[pd.DataFrame, st
 def read_any_file(uploaded, auto_header: bool, manual_header: int | None):
     name = uploaded.name.lower()
 
-    # Excel
     if name.endswith(("xlsx", "xls")):
         file_bytes = uploaded.getvalue()
         excel_bytes = io.BytesIO(file_bytes)
-        engines_to_try = ["openpyxl", "xlrd"]
-        last_err = None
 
-        for engine in engines_to_try:
+        # Try real Excel first
+        for engine in ["openpyxl", "xlrd"]:
             try:
                 excel_bytes.seek(0)
                 xls = pd.ExcelFile(excel_bytes, engine=engine)
-
                 cleaned = {}
                 header_rows = {}
-                row_report = {}
-
                 for sh in xls.sheet_names:
-                    df_sh, header_row, before_rows, after_rows = read_excel_sheet_smart_from_bytes(
+                    df_sh, header_row = read_excel_sheet_smart_from_bytes(
                         excel_bytes, sh, engine=engine,
                         auto_header=auto_header, manual_header=manual_header
                     )
@@ -345,37 +329,25 @@ def read_any_file(uploaded, auto_header: bool, manual_header: int | None):
                         continue
                     cleaned[str(sh).strip()] = df_sh
                     header_rows[str(sh).strip()] = header_row
-                    row_report[str(sh).strip()] = (before_rows, after_rows)
 
-                return {
-                    "type": "excel",
-                    "sheets": cleaned,
-                    "header_rows": header_rows,
-                    "row_report": row_report,
-                    "excel_engine": engine,
-                }
-            except Exception as e:
-                last_err = e
+                return {"type": "excel", "sheets": cleaned, "header_rows": header_rows, "excel_engine": engine}
+            except Exception:
+                pass
 
-        # fake XLS fallback
-        try:
-            sample = file_bytes[:4000]
-            if looks_like_utf16_text(sample):
-                df, note = try_read_delimited_bytes_as_df(file_bytes)
-                return {"type": "table", "df": df, "note": note}
-        except Exception:
-            pass
+        # Fake XLS fallback
+        sample = file_bytes[:4000]
+        if looks_like_utf16_text(sample):
+            df, note = try_read_delimited_bytes_as_df(file_bytes)
+            return {"type": "table", "df": df, "note": note}
 
-        raise last_err
+        raise ValueError("Could not read this Excel/XLS file.")
 
-    # JSON
     if name.endswith("json"):
         uploaded.seek(0)
         df = pd.read_json(uploaded, dtype=object)
         df = clean_df(df)
         return {"type": "table", "df": df}
 
-    # Text tables
     sep = "\t" if name.endswith("tsv") else ","
     df, used_encoding = read_text_table_with_fallback(uploaded, sep=sep)
     return {"type": "table", "df": df, "encoding": used_encoding}
@@ -386,11 +358,9 @@ uploaded_files = st.file_uploader("Upload file(s)", type=SUPPORTED_TYPES, accept
 
 mode = st.radio("What do you want to do?", ["Auto split + convert", "Convert only"], index=0)
 
-output_format = st.radio(
-    "Output format",
-    ["CSV", "XLSX"],
-    index=0
-)
+output_format = st.radio("Output format", ["CSV", "XLSX"], index=0)
+
+exclude_zero = st.checkbox("Exclude stock/outlet_value = 0 (splitting only)", value=False)
 
 keep_outlet_id_only_in_filename = st.checkbox(
     "When splitting, keep outlet id only in the filename",
@@ -404,14 +374,12 @@ if st.checkbox("Manual header row override", value=False):
     manual_header = st.number_input("Header row index (0 = first row)", min_value=0, max_value=200, value=0, step=1)
 
 def write_file(z: zipfile.ZipFile, path_no_ext: str, df: pd.DataFrame, sheet_name: str = "Sheet1"):
-    if output_format.startswith("XLSX"):
+    if output_format == "XLSX":
         z.writestr(f"{path_no_ext}.xlsx", to_xlsx_bytes_single_sheet(df, sheet_name=sheet_name))
     else:
         z.writestr(f"{path_no_ext}.csv", to_csv_bytes(df))
 
-def write_workbook_convert_only(z: zipfile.ZipFile, out_path_no_ext: str, sheets: dict):
-    # for convert-only + XLSX, keep one file same name, multi-sheet
-    z.writestr(f"{out_path_no_ext}.xlsx", to_xlsx_bytes_multi_sheet(sheets))
+# ---------------- Run ----------------
 
 if uploaded_files:
     big_zip = io.BytesIO()
@@ -427,60 +395,52 @@ if uploaded_files:
                 z.writestr(f"{folder}/ERROR.txt", f"Failed to read file: {uploaded.name}\n\n{repr(e)}")
                 continue
 
-            # info files
+            # info
             if result.get("excel_engine"):
                 z.writestr(f"{folder}/INFO_excel_engine.txt", f"Excel engine used: {result['excel_engine']}")
             if result.get("encoding"):
                 z.writestr(f"{folder}/INFO_encoding.txt", f"Read using encoding: {result['encoding']}")
             if result.get("note"):
                 z.writestr(f"{folder}/INFO_note.txt", result["note"])
-            if result.get("row_report"):
-                lines = [f"{sh}: rows_read={b} | rows_after_clean={a}" for sh, (b, a) in result["row_report"].items()]
-                z.writestr(f"{folder}/INFO_rows_report.txt", "\n".join(lines))
 
-           # ---------------- Convert only = ONLY convert (NO outlet splitting) ----------------
-if mode == "Convert only (no splitting)":
-    if result["type"] == "excel":
-        sheets = result["sheets"] or {}
-        if not sheets:
-            z.writestr(f"{folder}/ERROR.txt", "No readable data found in this Excel file.")
-            continue
+            # ---------------- Convert only (ONLY convert; NO outlet splitting) ----------------
+            if mode == "Convert only":
+                if result["type"] == "excel":
+                    sheets = result["sheets"] or {}
+                    if not sheets:
+                        z.writestr(f"{folder}/ERROR.txt", "No readable data found in this Excel file.")
+                        continue
 
-        if output_format.startswith("XLSX"):
-            # ✅ Keep ALL sheets, ONE workbook, same name
-            z.writestr(f"{folder}/{base}.xlsx", to_xlsx_bytes_multi_sheet(sheets))
+                    if output_format == "XLSX":
+                        # one workbook same name, all sheets preserved
+                        z.writestr(f"{folder}/{base}.xlsx", to_xlsx_bytes_multi_sheet(sheets))
+                    else:
+                        # one CSV same name (stack sheets; adds _sheet)
+                        frames = []
+                        for sh, df_sh in sheets.items():
+                            out = df_sh.copy()
+                            out.insert(0, "_sheet", sh)
+                            frames.append(out)
+                        merged = pd.concat(frames, ignore_index=True)
+                        write_file(z, f"{folder}/{base}", merged, sheet_name=base)
+                else:
+                    df = result["df"]
+                    if df is None or df.empty:
+                        z.writestr(f"{folder}/ERROR.txt", "No readable rows found.")
+                        continue
+                    write_file(z, f"{folder}/{base}", df, sheet_name=base)
 
-        else:
-            # ✅ CSV cannot store multiple sheets, so make ONE CSV by stacking
-            frames = []
-            for sh, df_sh in sheets.items():
-                out = df_sh.copy()
-                out.insert(0, "_sheet", sh)  # keeps sheet origin
-                frames.append(out)
-            merged = pd.concat(frames, ignore_index=True)
+                z.writestr(f"{folder}/INFO.txt", "Convert only → converted format only (no splitting).")
+                continue
 
-            write_file(z, f"{folder}/{base}", merged, sheet_name=base)
-
-    else:
-        # table/text/fake-xls -> ONE file, same name
-        df = result["df"]
-        if df is None or df.empty:
-            z.writestr(f"{folder}/ERROR.txt", "No readable rows found.")
-            continue
-
-        write_file(z, f"{folder}/{base}", df, sheet_name=base)
-
-    z.writestr(f"{folder}/INFO.txt", "Convert-only mode → converted ONLY (no outlet splitting).")
-    continue
-
-            # ---------------- Auto split + convert (NO combined output) ----------------
+            # ---------------- Auto split + convert (splitting mode) ----------------
             if result["type"] == "excel":
                 sheets = result["sheets"] or {}
                 if not sheets:
                     z.writestr(f"{folder}/ERROR.txt", "No readable data found in this Excel file.")
                     continue
 
-                # multiple sheets => treat each sheet as outlet, filename = sheet only (no outlet_)
+                # if multiple sheets -> treat each sheet as an outlet file (name = sheet)
                 if len(sheets) > 1:
                     combined_frames = []
                     for sh, df_sh in sheets.items():
@@ -490,13 +450,13 @@ if mode == "Convert only (no splitting)":
                         out.insert(0 if keep_outlet_id_only_in_filename else 1, "_sheet", sh)
                         combined_frames.append(out)
 
-                        # ✅ filename = sheet name only
+                        # filename = sheet only
                         write_file(z, f"{folder}/{safe_name(sh)}", out, sheet_name=sh)
 
-                    # keep long_format only (no combined)
+                    # long_format only (no combined)
                     long_df = pd.concat(combined_frames, ignore_index=True)
                     write_file(z, f"{folder}/long_format", long_df, sheet_name="long_format")
-                    z.writestr(f"{folder}/INFO.txt", "Detected multiple sheets → split per sheet/outlet. (No combined output)")
+                    z.writestr(f"{folder}/INFO.txt", "Split mode → split per sheet/outlet. (No combined output)")
                     continue
 
                 df = list(sheets.values())[0]
@@ -534,10 +494,10 @@ if mode == "Convert only (no splitting)":
                     if not keep_outlet_id_only_in_filename:
                         out_df.insert(0, "outlet_id", oc)
 
-                    # ✅ filename = outlet id only
+                    # filename = outlet id only
                     write_file(z, f"{folder}/{safe_name(oc)}", out_df, sheet_name=str(oc))
 
-                z.writestr(f"{folder}/INFO.txt", "Detected outlets as COLUMNS → split per outlet column. (No combined output)")
+                z.writestr(f"{folder}/INFO.txt", "Split mode → outlets detected as COLUMNS. (No combined output)")
                 continue
 
             # outlets as rows
@@ -549,26 +509,24 @@ if mode == "Convert only (no splitting)":
                 outlet_row_col = detect_outlet_row_column_smart(df)
 
             if outlet_row_col:
-                z.writestr(f"{folder}/INFO_outlet_column.txt", f"Outlet column detected: {outlet_row_col}")
-
                 for outlet, grp in df.groupby(outlet_row_col, dropna=False):
                     grp = grp.copy()
                     if not keep_outlet_id_only_in_filename:
                         grp.insert(0, "outlet_id", outlet)
 
-                    # ✅ filename = outlet id only
+                    # filename = outlet id only
                     write_file(z, f"{folder}/{safe_name(outlet)}", grp, sheet_name=str(outlet))
 
                 long_df = df.copy()
                 long_df.insert(0, "outlet_id", long_df[outlet_row_col])
                 write_file(z, f"{folder}/long_format", long_df, sheet_name="long_format")
 
-                z.writestr(f"{folder}/INFO.txt", f"Detected outlets as ROWS using column: {outlet_row_col}. (No combined output)")
+                z.writestr(f"{folder}/INFO.txt", f"Split mode → outlets detected as ROWS ({outlet_row_col}). (No combined output)")
                 continue
 
-            # fallback (no outlet detected) — just export original name
+            # fallback: if no outlet detected, just export original name
             write_file(z, f"{folder}/{base}", df, sheet_name=base)
-            z.writestr(f"{folder}/INFO.txt", "No outlet detected → exported single file with original name (no combined).")
+            z.writestr(f"{folder}/INFO.txt", "Split mode → no outlet detected; exported single file with original name.")
 
     st.success("Processed files successfully ✅")
     st.download_button(
