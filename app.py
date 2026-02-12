@@ -6,19 +6,16 @@ import re
 
 st.set_page_config(page_title="Outlet Splitter", layout="centered")
 st.title("🧩 Outlet Splitter & CSV Converter (Boss-safe)")
-st.caption("Upload file(s) → get Google-Sheets-ready files + split by outlet (rows / columns / sheets). No row loss.")
+st.caption("Upload file(s) → split by outlet (rows / columns / sheets) + convert. Preserves rows.")
 
 SUPPORTED_TYPES = ["csv", "tsv", "txt", "xlsx", "xls", "json"]
 
 # ---------------- Helpers ----------------
 
 def clean_price_column_only(text):
-    """ULTRA aggressive cleaning ONLY for price/numeric columns."""
     if text is None or (isinstance(text, float) and pd.isna(text)):
         return text
-
     s = str(text)
-
     safe_chars = []
     for char in s:
         code = ord(char)
@@ -26,25 +23,20 @@ def clean_price_column_only(text):
             safe_chars.append(char)
         elif char in ['\n', '\r', '\t']:
             safe_chars.append(' ')
-
     s = ''.join(safe_chars)
     s = ' '.join(s.split())
     return s.strip()
 
 def normalize_numeric_like_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Fix only numeric/price columns that may contain hidden junk."""
     def extract_clean_number(x):
         if x is None or (isinstance(x, float) and pd.isna(x)):
             return x
-
         s = clean_price_column_only(x)
         if not s:
             return ""
-
         m = re.search(r'[-+]?\d+(?:[.,]\d+)?', s)
         if not m:
             return s
-
         token = m.group(0).replace(',', '.')
         return token
 
@@ -61,10 +53,10 @@ def normalize_numeric_like_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Minimal cleaning, no row dropping. Only drop fully empty columns."""
-    df = df.dropna(axis=1, how='all')
+    # ✅ never drop rows
+    df = df.dropna(axis=1, how='all')  # only empty columns
 
-    # Clean column names safely
+    # sanitize column names (ASCII-safe)
     cleaned_cols = []
     for c in df.columns:
         col_str = str(c)
@@ -78,10 +70,9 @@ def clean_df(df: pd.DataFrame) -> pd.DataFrame:
         cleaned = ''.join(safe_chars).strip()
         cleaned = ' '.join(cleaned.split())
         cleaned_cols.append(cleaned if cleaned else 'Unnamed')
-
     df.columns = cleaned_cols
 
-    # Trim whitespace in string cells
+    # trim strings
     for c in df.columns:
         if df[c].dtype == object:
             df[c] = df[c].apply(lambda x: x.strip() if isinstance(x, str) else x)
@@ -97,7 +88,7 @@ def safe_name(s: str) -> str:
     return s[:120] if s else "UNKNOWN"
 
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    # ✅ UTF-8 with BOM = best for Excel + Sheets
+    # ✅ UTF-8 with BOM: Excel + Google Sheets friendly
     return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 def to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
@@ -114,17 +105,10 @@ def detect_outlet_columns(df: pd.DataFrame):
 
 def detect_outlet_row_column(df: pd.DataFrame):
     priority_patterns = [
-        r"\boutlet\s*id\b",
-        r"\bstore\s*id\b",
-        r"\bbranch\s*id\b",
-        r"\boutlet\b",
-        r"\bbranch\b",
-        r"\bstore\b",
-        r"\bsite\s*no\b",
-        r"\bsite\b",
-        r"\blocation\b",
+        r"\boutlet\s*id\b", r"\bstore\s*id\b", r"\bbranch\s*id\b",
+        r"\boutlet\b", r"\bbranch\b", r"\bstore\b",
+        r"\bsite\s*no\b", r"\bsite\b", r"\blocation\b",
     ]
-
     cols = list(df.columns)
     for pat in priority_patterns:
         for c in cols:
@@ -143,54 +127,41 @@ def detect_outlet_row_column_smart(df: pd.DataFrame):
     col = detect_outlet_row_column(df)
     if col:
         return col
-
     if df is None or df.empty:
         return None
 
     bad_keywords = ["upc", "barcode", "gtin", "sku", "item", "product", "price", "qty",
                     "quantity", "stock", "name", "description", "plu"]
     best = None
-
     for c in df.columns[:25]:
         lc = str(c).lower().strip()
         if any(k in lc for k in bad_keywords):
             continue
-
         series = df[c].dropna()
         if series.empty:
             continue
-
         nun = series.nunique()
         total = len(series)
         ratio = nun / max(1, total)
-
-        if nun < 2:
+        if nun < 2 or ratio > 0.7:
             continue
-        if ratio > 0.7:
-            continue
-
         sample = series.astype(str).head(40)
         looks_id = sample.apply(lambda x: bool(re.fullmatch(r"\d{3,}", x.strip()))).mean()
         score = (1 - ratio) * 3 + looks_id * 5
-
         if best is None or score > best[0]:
             best = (score, c)
-
     return best[1] if best else None
 
 def apply_combined_outlet_key_if_possible(df: pd.DataFrame):
     def norm(s): return str(s).lower().strip()
-
     site_col = None
     outletid_col = None
-
     for c in df.columns:
         lc = norm(c)
         if site_col is None and re.search(r"\bsite\s*no\b", lc):
             site_col = c
         if outletid_col is None and re.search(r"\boutlet\s*id\b", lc):
             outletid_col = c
-
     if site_col and outletid_col:
         df2 = df.copy()
         df2["_outlet_key"] = (
@@ -198,31 +169,9 @@ def apply_combined_outlet_key_if_possible(df: pd.DataFrame):
             df2[outletid_col].astype(str).fillna("UNKNOWN")
         )
         return df2, "_outlet_key"
-
     return df, None
 
-# ---------------- Robust reading (no NA conversion) ----------------
-
-def read_text_table_with_fallback(file_like, sep: str) -> tuple[pd.DataFrame, str]:
-    encodings_to_try = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
-    last_err = None
-    for enc in encodings_to_try:
-        try:
-            file_like.seek(0)
-            df = pd.read_csv(
-                file_like,
-                sep=sep,
-                dtype=object,
-                encoding=enc,
-                keep_default_na=False,
-                na_filter=False
-            )
-            return df, enc
-        except Exception as e:
-            last_err = e
-    raise last_err
-
-# ---------------- Safe header-row auto detection ----------------
+# ---------------- Safe header detection ----------------
 
 HEADER_TOKENS = [
     "upc", "barcode", "gtin", "sku",
@@ -235,7 +184,6 @@ HEADER_TOKENS = [
 def detect_header_row_from_preview(preview_df: pd.DataFrame, max_rows: int = 30) -> int:
     best_row = 0
     best_hits = -1
-
     rows_to_check = min(max_rows, len(preview_df))
     for r in range(rows_to_check):
         row = preview_df.iloc[r].tolist()
@@ -244,12 +192,8 @@ def detect_header_row_from_preview(preview_df: pd.DataFrame, max_rows: int = 30)
         if hits > best_hits:
             best_hits = hits
             best_row = r
-
-    # ✅ Safety: if detection is weak, don't move header away from row 0
     if best_hits < 2:
         return 0
-
-    # ✅ Safety: never auto-skip more than 5 rows
     return min(best_row, 5)
 
 def read_excel_sheet_smart_from_bytes(excel_bytes: io.BytesIO, sheet_name: str, engine: str, auto_header: bool, manual_header: int | None):
@@ -259,14 +203,8 @@ def read_excel_sheet_smart_from_bytes(excel_bytes: io.BytesIO, sheet_name: str, 
         header_row = manual_header
     elif auto_header:
         preview = pd.read_excel(
-            excel_bytes,
-            sheet_name=sheet_name,
-            header=None,
-            nrows=40,
-            dtype=object,
-            engine=engine,
-            keep_default_na=False,
-            na_filter=False
+            excel_bytes, sheet_name=sheet_name, header=None, nrows=40,
+            dtype=object, engine=engine, keep_default_na=False, na_filter=False
         )
         header_row = detect_header_row_from_preview(preview, max_rows=30)
     else:
@@ -274,22 +212,16 @@ def read_excel_sheet_smart_from_bytes(excel_bytes: io.BytesIO, sheet_name: str, 
 
     excel_bytes.seek(0)
     df = pd.read_excel(
-        excel_bytes,
-        sheet_name=sheet_name,
-        header=header_row,
-        dtype=object,
-        engine=engine,
-        keep_default_na=False,
-        na_filter=False
+        excel_bytes, sheet_name=sheet_name, header=header_row,
+        dtype=object, engine=engine, keep_default_na=False, na_filter=False
     )
 
     before_rows = len(df)
     df = clean_df(df)
     after_rows = len(df)
-
     return df, header_row, before_rows, after_rows
 
-# ---------------- Fake XLS fallback (UTF-16 TSV in disguise) ----------------
+# ---------------- Fake XLS fallback (FIXED) ----------------
 
 def looks_like_utf16_text(sample: bytes) -> bool:
     if sample.startswith(b"\xff\xfe") or sample.startswith(b"\xfe\xff"):
@@ -297,33 +229,68 @@ def looks_like_utf16_text(sample: bytes) -> bool:
     return b"\x00" in sample
 
 def try_read_delimited_bytes_as_df(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
-    seps = ["\t", ",", ";", "|"]
-    encs = ["utf-16", "utf-16-le", "utf-16-be", "utf-8", "utf-8-sig", "cp1252", "latin1"]
+    """
+    ✅ FIX: read bytes directly with encoding (NO decode ignore)
+    Tries UTF-16 + tab first (common fake XLS), then other separators/encodings.
+    """
+    attempts = [
+        ("utf-16", "\t"),
+        ("utf-16-le", "\t"),
+        ("utf-16-be", "\t"),
+        ("utf-8-sig", "\t"),
+        ("cp1252", "\t"),
+        ("latin1", "\t"),
+        ("utf-8-sig", ","),
+        ("cp1252", ","),
+        ("latin1", ","),
+        ("utf-8-sig", ";"),
+        ("cp1252", ";"),
+        ("latin1", ";"),
+        ("utf-8-sig", "|"),
+        ("cp1252", "|"),
+        ("latin1", "|"),
+    ]
 
     last_err = None
-    for enc in encs:
-        for sep in seps:
-            try:
-                text = file_bytes.decode(enc, errors="ignore")
-                df = pd.read_csv(
-                    io.StringIO(text),
-                    sep=sep,
-                    dtype=object,
-                    keep_default_na=False,
-                    na_filter=False
-                )
-                df = clean_df(df)
-                if df is not None and not df.empty and len(df.columns) > 1:
-                    return df, f"Parsed as delimited text (enc={enc}, sep={repr(sep)})"
-            except Exception as e:
-                last_err = e
+    for enc, sep in attempts:
+        try:
+            bio = io.BytesIO(file_bytes)
+            df = pd.read_csv(
+                bio,
+                sep=sep,
+                encoding=enc,
+                dtype=object,
+                keep_default_na=False,
+                na_filter=False,
+                engine="python"  # more tolerant with weird rows
+            )
+            df = clean_df(df)
+            if df is not None and not df.empty and len(df.columns) > 1:
+                return df, f"Parsed as delimited text (enc={enc}, sep={repr(sep)})"
+        except Exception as e:
+            last_err = e
 
     raise last_err or ValueError("Could not parse as delimited text")
+
+def read_text_table_with_fallback(file_like, sep: str) -> tuple[pd.DataFrame, str]:
+    encodings_to_try = ["utf-8", "utf-8-sig", "cp1252", "latin1"]
+    last_err = None
+    for enc in encodings_to_try:
+        try:
+            file_like.seek(0)
+            df = pd.read_csv(
+                file_like, sep=sep, dtype=object, encoding=enc,
+                keep_default_na=False, na_filter=False, engine="python"
+            )
+            return df, enc
+        except Exception as e:
+            last_err = e
+    raise last_err
 
 def read_any_file(uploaded, auto_header: bool, manual_header: int | None):
     name = uploaded.name.lower()
 
-    # Excel (.xlsx / .xls)
+    # Excel
     if name.endswith(("xlsx", "xls")):
         file_bytes = uploaded.getvalue()
         excel_bytes = io.BytesIO(file_bytes)
@@ -364,7 +331,7 @@ def read_any_file(uploaded, auto_header: bool, manual_header: int | None):
             except Exception as e:
                 last_err = e
 
-        # ✅ FALLBACK: some .XLS are not real Excel; they're UTF-16 TSV/text
+        # Fake XLS fallback
         try:
             sample = file_bytes[:4000]
             if looks_like_utf16_text(sample):
@@ -400,11 +367,11 @@ mode = st.radio(
 
 output_format = st.radio(
     "Output format",
-    ["XLSX (Google Sheets safe)", "CSV (utf-8-sig — Excel/Sheets friendly)"],
-    index=1
+    ["CSV (utf-8-sig — Excel/Sheets friendly)", "XLSX (Google Sheets safe)"],
+    index=0
 )
 
-exclude_zero = st.checkbox("Exclude stock/outlet_value = 0 (when splitting)", value=False)
+exclude_zero = st.checkbox("Exclude outlet_value/stock = 0 (when splitting)", value=False)
 
 keep_outlet_id_only_in_filename = st.checkbox(
     "When splitting, keep outlet id ONLY in the filename (don't add outlet_id column inside file)",
@@ -436,85 +403,52 @@ if uploaded_files:
                 z.writestr(f"{folder}/ERROR.txt", f"Failed to read file: {uploaded.name}\n\n{repr(e)}")
                 continue
 
-            # Debug info files
+            # Info
             if result.get("encoding"):
                 z.writestr(f"{folder}/INFO_encoding.txt", f"Read using encoding: {result['encoding']}")
             if result.get("excel_engine"):
                 z.writestr(f"{folder}/INFO_excel_engine.txt", f"Excel engine used: {result['excel_engine']}")
             if result.get("note"):
                 z.writestr(f"{folder}/INFO_note.txt", result["note"])
-
             if result.get("row_report"):
-                lines = []
-                for sh, (b, a) in result["row_report"].items():
-                    lines.append(f"{sh}: rows_read={b} | rows_after_clean={a}")
+                lines = [f"{sh}: rows_read={b} | rows_after_clean={a}" for sh, (b, a) in result["row_report"].items()]
                 z.writestr(f"{folder}/INFO_rows_report.txt", "\n".join(lines))
 
-            if result.get("header_rows"):
-                rows_info = "\n".join([f"{sh}: header_row={hr}" for sh, hr in result["header_rows"].items()])
-                z.writestr(f"{folder}/INFO_excel_header_rows.txt", rows_info)
-
-            def get_df_single():
-                if result["type"] == "excel":
-                    sheets = result["sheets"]
-                    if not sheets:
-                        return None
-                    if len(sheets) == 1:
-                        return list(sheets.values())[0]
-                    return None
-                else:
-                    return result["df"]
-
-            # -------- Convert-only --------
+            # Convert only
             if mode == "Convert only (no splitting)":
                 if result["type"] == "excel":
                     sheets = result["sheets"]
                     if not sheets:
                         z.writestr(f"{folder}/ERROR.txt", "No readable data found in this file.")
                         continue
-
                     for sh, df_sh in sheets.items():
                         write_file(z, f"{folder}/{safe_name(sh)}", df_sh, sheet_name=sh)
-
-                    if len(sheets) > 1:
-                        combined_frames = []
-                        for sh, df_sh in sheets.items():
-                            out = df_sh.copy()
-                            out.insert(0, "_sheet", sh)
-                            combined_frames.append(out)
-                        combined_df = pd.concat(combined_frames, ignore_index=True)
-                        write_file(z, f"{folder}/combined", combined_df, sheet_name="combined")
-
                 else:
                     df = result["df"]
                     if df is None or df.empty:
                         z.writestr(f"{folder}/ERROR.txt", "No readable rows found.")
                         continue
                     write_file(z, f"{folder}/combined", df, sheet_name="combined")
-
                 z.writestr(f"{folder}/INFO.txt", "Convert-only mode → no splitting performed.")
                 continue
 
-            # -------- Auto split + convert --------
+            # Auto split + convert
             if result["type"] == "excel":
                 sheets = result["sheets"]
                 if not sheets:
                     z.writestr(f"{folder}/ERROR.txt", "No readable data found in this file.")
                     continue
 
-                # Multiple sheets => treat each as outlet
+                # multiple sheets => each sheet outlet
                 if len(sheets) > 1:
                     combined_frames = []
                     for sh, df_sh in sheets.items():
                         out = df_sh.copy()
-
                         if not keep_outlet_id_only_in_filename:
                             out.insert(0, "outlet_id", sh)
                         out.insert(0 if keep_outlet_id_only_in_filename else 1, "_sheet", sh)
-
                         combined_frames.append(out)
                         write_file(z, f"{folder}/outlet_{safe_name(sh)}", out, sheet_name=sh)
-
                     combined_df = pd.concat(combined_frames, ignore_index=True)
                     write_file(z, f"{folder}/combined", combined_df, sheet_name="combined")
                     write_file(z, f"{folder}/long_format", combined_df, sheet_name="long_format")
@@ -529,7 +463,7 @@ if uploaded_files:
                 z.writestr(f"{folder}/ERROR.txt", "No readable rows found.")
                 continue
 
-            # Outlets as columns (numeric outlet IDs as headers)
+            # outlets as columns
             outlet_cols = detect_outlet_columns(df)
             if outlet_cols:
                 base_cols = [c for c in df.columns if c not in outlet_cols]
@@ -541,28 +475,25 @@ if uploaded_files:
                     var_name="outlet_id",
                     value_name="outlet_value"
                 )
-
                 if exclude_zero:
-                    long_df = long_df[long_df["outlet_value"].astype(str).str.strip().isin(["0", "0.0", ""]) == False]
+                    v = long_df["outlet_value"].astype(str).str.strip()
+                    long_df = long_df[~v.isin(["", "0", "0.0"])]
 
                 write_file(z, f"{folder}/long_format", long_df, sheet_name="long_format")
 
                 for oc in outlet_cols:
-                    out_df = df[base_cols + [oc]].copy()
-                    out_df = out_df.rename(columns={oc: "outlet_value"})
-
-                    if exclude_zero and "outlet_value" in out_df.columns:
-                        out_df = out_df[out_df["outlet_value"].astype(str).str.strip().isin(["0", "0.0", ""]) == False]
-
+                    out_df = df[base_cols + [oc]].copy().rename(columns={oc: "outlet_value"})
+                    if exclude_zero:
+                        v = out_df["outlet_value"].astype(str).str.strip()
+                        out_df = out_df[~v.isin(["", "0", "0.0"])]
                     if not keep_outlet_id_only_in_filename:
                         out_df.insert(0, "outlet_id", oc)
-
                     write_file(z, f"{folder}/outlet_{safe_name(oc)}", out_df, sheet_name=str(oc))
 
                 z.writestr(f"{folder}/INFO.txt", "Detected outlets as COLUMNS (numeric outlet ids in headers).")
                 continue
 
-            # Outlets as rows (detect outlet column)
+            # outlets as rows
             df2, combined_key = apply_combined_outlet_key_if_possible(df)
             if combined_key:
                 outlet_row_col = combined_key
@@ -577,17 +508,8 @@ if uploaded_files:
 
                 for outlet, grp in df.groupby(outlet_row_col, dropna=False):
                     grp = grp.copy()
-
-                    if exclude_zero:
-                        # If there's a stock-like col, try filter it. Otherwise no harm.
-                        candidates = [c for c in grp.columns if str(c).lower().strip() in ["stock", "qty", "quantity", "outlet_value"]]
-                        if candidates:
-                            c0 = candidates[0]
-                            grp = grp[grp[c0].astype(str).str.strip().isin(["0", "0.0", ""]) == False]
-
                     if not keep_outlet_id_only_in_filename:
                         grp.insert(0, "outlet_id", outlet)
-
                     write_file(z, f"{folder}/outlet_{safe_name(outlet)}", grp, sheet_name=str(outlet))
 
                 long_df = df.copy()
@@ -597,7 +519,7 @@ if uploaded_files:
                 z.writestr(f"{folder}/INFO.txt", f"Detected outlets as ROWS using column: {outlet_row_col}")
                 continue
 
-            # Fallback
+            # fallback
             write_file(z, f"{folder}/combined", df, sheet_name="combined")
             z.writestr(f"{folder}/INFO.txt", "No outlet detected → exported combined only.")
 
