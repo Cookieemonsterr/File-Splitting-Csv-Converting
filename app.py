@@ -221,7 +221,7 @@ def read_excel_sheet_smart_from_bytes(excel_bytes: io.BytesIO, sheet_name: str, 
     after_rows = len(df)
     return df, header_row, before_rows, after_rows
 
-# ---------------- Fake XLS fallback (FIXED) ----------------
+# ---------------- Fake XLS fallback (THE IMPORTANT FIX) ----------------
 
 def looks_like_utf16_text(sample: bytes) -> bool:
     if sample.startswith(b"\xff\xfe") or sample.startswith(b"\xfe\xff"):
@@ -230,9 +230,12 @@ def looks_like_utf16_text(sample: bytes) -> bool:
 
 def try_read_delimited_bytes_as_df(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
     """
-    ✅ FIX: read bytes directly with encoding (NO decode ignore)
-    Tries UTF-16 + tab first (common fake XLS), then other separators/encodings.
+    ✅ Robust fake-xls reader:
+    1) Try UTF-16 TSV directly
+    2) If rows look suspiciously low, strip ALL null bytes and parse as normal TSV (latin1)
+    This matches your file and keeps all rows.
     """
+    # --- attempt 1: true UTF-16 style ---
     attempts = [
         ("utf-16", "\t"),
         ("utf-16-le", "\t"),
@@ -240,35 +243,48 @@ def try_read_delimited_bytes_as_df(file_bytes: bytes) -> tuple[pd.DataFrame, str
         ("utf-8-sig", "\t"),
         ("cp1252", "\t"),
         ("latin1", "\t"),
-        ("utf-8-sig", ","),
-        ("cp1252", ","),
-        ("latin1", ","),
-        ("utf-8-sig", ";"),
-        ("cp1252", ";"),
-        ("latin1", ";"),
-        ("utf-8-sig", "|"),
-        ("cp1252", "|"),
-        ("latin1", "|"),
     ]
 
+    def parse_bytes(enc, sep, b):
+        bio = io.BytesIO(b)
+        df = pd.read_csv(
+            bio,
+            sep=sep,
+            encoding=enc,
+            dtype=object,
+            keep_default_na=False,
+            na_filter=False,
+            engine="python"
+        )
+        df = clean_df(df)
+        return df
+
     last_err = None
+
+    # line-count estimate (based on raw newlines)
+    approx_lines = file_bytes.count(b"\n") + file_bytes.count(b"\n\x00")
+    if approx_lines < 10:
+        approx_lines = None
+
     for enc, sep in attempts:
         try:
-            bio = io.BytesIO(file_bytes)
-            df = pd.read_csv(
-                bio,
-                sep=sep,
-                encoding=enc,
-                dtype=object,
-                keep_default_na=False,
-                na_filter=False,
-                engine="python"  # more tolerant with weird rows
-            )
-            df = clean_df(df)
+            df = parse_bytes(enc, sep, file_bytes)
             if df is not None and not df.empty and len(df.columns) > 1:
+                # If parse looks too small vs raw line count, try null-strip path
+                if approx_lines and len(df) < int(approx_lines * 0.8):
+                    break
                 return df, f"Parsed as delimited text (enc={enc}, sep={repr(sep)})"
         except Exception as e:
             last_err = e
+
+    # --- attempt 2: NULL-STRIP (THIS IS THE MAGIC FOR YOUR FILE) ---
+    try:
+        b2 = file_bytes.replace(b"\x00", b"")
+        df2 = parse_bytes("latin1", "\t", b2)
+        if df2 is not None and not df2.empty and len(df2.columns) > 1:
+            return df2, "Parsed as NULL-stripped TSV (best compatibility for fake .XLS)"
+    except Exception as e:
+        last_err = e
 
     raise last_err or ValueError("Could not parse as delimited text")
 
