@@ -361,10 +361,6 @@ mode = st.radio("What do you want to do?", ["Auto split + convert", "Convert onl
 output_format = st.radio("Output format", ["CSV", "XLSX"], index=0)
 
 exclude_zero = st.checkbox("Exclude stock/outlet_value = 0", value=False)
-
-keep_outlet_id_only_in_filename = st.checkbox(
-    "When splitting, keep outlet id only in the filename",
-    value=True
 )
 
 st.markdown("---")
@@ -381,7 +377,6 @@ def write_file(z: zipfile.ZipFile, path_no_ext: str, df: pd.DataFrame, sheet_nam
         z.writestr(f"{path_no_ext}.csv", to_csv_bytes(df))
 
 
-# ---------------- Run ----------------
 
 if uploaded_files:
     big_zip = io.BytesIO()
@@ -429,7 +424,6 @@ if uploaded_files:
 
                 continue
 
-            # ✅ Auto split + convert (folders per file remain)
             if result["type"] == "excel":
                 sheets = result["sheets"] or {}
                 if not sheets:
@@ -437,19 +431,10 @@ if uploaded_files:
                     continue
 
                 if len(sheets) > 1:
-                    combined_frames = []
-                    for sh, df_sh in sheets.items():
-                        out = df_sh.copy()
-                        if not keep_outlet_id_only_in_filename:
-                            out.insert(0, "outlet_id", sh)
-                        out.insert(0 if keep_outlet_id_only_in_filename else 1, "_sheet", sh)
-                        combined_frames.append(out)
-
-                        write_file(z, f"{folder}/{safe_name(sh)}", out, sheet_name=sh)
-
-                    long_df = pd.concat(combined_frames, ignore_index=True)
-                    write_file(z, f"{folder}/long_format", long_df, sheet_name="long_format")
-                    continue
+    for sh, df_sh in sheets.items():
+        out = df_sh.copy()  
+        write_file(z, f"{folder}/{safe_name(sh)}", out, sheet_name=sh)
+    continue
 
                 df = list(sheets.values())[0]
             else:
@@ -474,18 +459,14 @@ if uploaded_files:
                     v = long_df["outlet_value"].astype(str).str.strip()
                     long_df = long_df[~v.isin(["", "0", "0.0"])]
 
-                write_file(z, f"{folder}/long_format", long_df, sheet_name="long_format")
 
                 for oc in outlet_cols:
-                    out_df = df[base_cols + [oc]].copy().rename(columns={oc: "outlet_value"})
-                    if exclude_zero:
-                        v = out_df["outlet_value"].astype(str).str.strip()
-                        out_df = out_df[~v.isin(["", "0", "0.0"])]
+                out_df = df[base_cols + [oc]].copy().rename(columns={oc: "outlet_value"})
+                if exclude_zero:
+                v = out_df["outlet_value"].astype(str).str.strip()
+                out_df = out_df[~v.isin(["", "0", "0.0"])]
 
-                    if not keep_outlet_id_only_in_filename:
-                        out_df.insert(0, "outlet_id", oc)
-
-                    write_file(z, f"{folder}/{safe_name(oc)}", out_df, sheet_name=str(oc))
+              write_file(z, f"{folder}/{safe_name(oc)}", out_df, sheet_name=str(oc))
 
                 continue
 
@@ -498,16 +479,9 @@ if uploaded_files:
 
             if outlet_row_col:
                 for outlet, grp in df.groupby(outlet_row_col, dropna=False):
-                    grp = grp.copy()
-                    if not keep_outlet_id_only_in_filename:
-                        grp.insert(0, "outlet_id", outlet)
-
-                    write_file(z, f"{folder}/{safe_name(outlet)}", grp, sheet_name=str(outlet))
-
-                long_df = df.copy()
-                long_df.insert(0, "outlet_id", long_df[outlet_row_col])
-                write_file(z, f"{folder}/long_format", long_df, sheet_name="long_format")
-                continue
+    grp = grp.copy()  
+    write_file(z, f"{folder}/{safe_name(outlet)}", grp, sheet_name=str(outlet))
+continue
 
             write_file(z, f"{folder}/{base}", df, sheet_name=base)
 
